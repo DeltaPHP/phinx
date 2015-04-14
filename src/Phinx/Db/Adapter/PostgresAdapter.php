@@ -948,12 +948,15 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
             }
             $indexName = sprintf('%s_%s', $tableName, implode('_', $columnNames));
         }
+        foreach($columnNames as $key=>$name) {
+            $columnNames[$key] = $this->quoteColumnName($name);
+        }
         $def = sprintf(
             "CREATE %s INDEX %s ON %s (%s);",
             ($index->getType() == Index::UNIQUE ? 'UNIQUE' : ''),
             $indexName,
             $this->quoteTableName($tableName),
-            implode(',', $index->getColumns())
+            implode(',', $columnNames)
         );
         return $def;
     }
