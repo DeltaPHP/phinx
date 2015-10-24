@@ -36,6 +36,8 @@ use Phinx\Migration\MigrationInterface;
 
 class PostgresAdapter extends PdoAdapter implements AdapterInterface
 {
+
+    const INT_SMALL   = 65535;
     /**
      * Columns with comments
      *
@@ -150,12 +152,18 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
      */
     public function hasTable($tableName)
     {
-        $tables = array();
-        $rows = $this->fetchAll(sprintf('SELECT table_name FROM information_schema.tables WHERE table_schema = \'%s\';', $this->getSchemaName()));
-        foreach ($rows as $row) {
-            $tables[] = strtolower($row[0]);
-        }
-        return in_array(strtolower($tableName), $tables);
+        $result = $this->getConnection()->query(
+            sprintf(
+                'SELECT *
+                FROM information_schema.tables
+                WHERE table_schema = %s
+                AND lower(table_name) = lower(%s)',
+                $this->getConnection()->quote($this->getSchemaName()),
+                $this->getConnection()->quote($tableName)
+            )
+        );
+
+        return $result->rowCount() === 1;
     }
 
     /**
@@ -306,7 +314,9 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
                    ->setType($this->getPhinxType($columnInfo['data_type']))
                    ->setNull($columnInfo['is_nullable'] == 'YES')
                    ->setDefault($columnInfo['column_default'])
-                   ->setIdentity($columnInfo['is_identity'] == 'YES');
+                   ->setIdentity($columnInfo['is_identity'] == 'YES')
+                   ->setPrecision($columnInfo['numeric_precision'])
+                   ->setScale($columnInfo['numeric_scale']);
 
             if (preg_match('/\bwith time zone$/', $columnInfo['data_type'])) {
                 $column->setTimezone(true);
@@ -531,6 +541,20 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
         return false;
     }
 
+     /**
+      * {@inheritdoc}
+      */
+     public function hasIndexByName($tableName, $indexName)
+     {
+         $indexes = $this->getIndexes($tableName);
+         foreach ($indexes as $name => $index) {
+             if ($name == $indexName) {
+                 return true;
+             }
+         }
+         return false;
+     }
+
     /**
      * {@inheritdoc}
      */
@@ -708,6 +732,13 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
     {
         switch ($type) {
             case static::PHINX_TYPE_INTEGER:
+                if ($limit && $limit == static::INT_SMALL) {
+                    return array(
+                        'name' => 'smallint',
+                        'limit' => static::INT_SMALL
+                    );
+                }
+                return array('name' => $type);
             case static::PHINX_TYPE_TEXT:
             case static::PHINX_TYPE_DECIMAL:
             case static::PHINX_TYPE_TIME:
@@ -719,6 +750,8 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
             case static::PHINX_TYPE_INET:
             case static::PHINX_TYPE_UUID:
                 return array('name' => $type);
+            case static::PHINX_TYPE_DECIMAL:
+                return array('name' => $type, 'precision' => 18, 'scale' => 0);
             case static::PHINX_TYPE_STRING:
                 return array('name' => 'character varying', 'limit' => 255);
             case static::PHINX_TYPE_CHAR:
@@ -730,6 +763,7 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
             case static::PHINX_TYPE_DATETIME:
             case static::PHINX_TYPE_TIMESTAMP:
                 return array('name' => 'timestamp');
+            case static::PHINX_TYPE_BLOB:
             case static::PHINX_TYPE_BINARY:
                 return array('name' => 'bytea');
             // Geospatial database types
@@ -773,10 +807,16 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
             case 'char':
                 return static::PHINX_TYPE_CHAR;
             case 'text':
-            case 'json':
                 return static::PHINX_TYPE_TEXT;
+            case 'json':
+                return static::PHINX_TYPE_JSON;
             case 'jsonb':
                 return static::PHINX_TYPE_JSONB;
+            case 'smallint':
+                return array(
+                    'name' => 'smallint',
+                    'limit' => static::INT_SMALL
+                );
             case 'bigserial':
                 return static::PHINX_TYPE_BIGSERIAL;
             case 'inet':
@@ -882,11 +922,19 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
         if ($column->isIdentity()) {
             $buffer[] = 'SERIAL';
         } else {
-            $sqlType = $this->getSqlType($column->getType());
+            $sqlType = $this->getSqlType($column->getType(), $column->getLimit());
             $buffer[] = strtoupper($sqlType['name']);
             // integers cant have limits in postgres
-            if ('integer' !== $sqlType['name'] && ($column->getLimit() || isset($sqlType['limit']))) {
-                $buffer[] = sprintf('(%s)', $column->getLimit() ? $column->getLimit() : $sqlType['limit']);
+            if (static::PHINX_TYPE_DECIMAL == $sqlType['name'] && ($column->getPrecision() || $column->getScale())) {
+                $buffer[] = sprintf(
+                    '(%s, %s)',
+                    $column->getPrecision() ? $column->getPrecision() : $sqlType['precision'],
+                    $column->getScale() ? $column->getScale() : $sqlType['scale']
+                );
+            } elseif (!in_array($sqlType['name'], array('integer', 'smallint'))) {
+                if ($column->getLimit() || isset($sqlType['limit'])) {
+                    $buffer[] = sprintf('(%s)', $column->getLimit() ? $column->getLimit() : $sqlType['limit']);
+                }
             }
 
             $timeTypes = array(
@@ -904,7 +952,6 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
             $buffer[] = $this->getDefaultValueDefinition($column->getDefault());
         }
 
-        // TODO - add precision & scale for decimals
         return implode(' ', $buffer);
     }
 
@@ -970,9 +1017,8 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
      */
     protected function getForeignKeySqlDefinition(ForeignKey $foreignKey, $tableName)
     {
-        $def = ' CONSTRAINT "';
-        $def .= $tableName . '_' . implode('_', $foreignKey->getColumns());
-        $def .= '" FOREIGN KEY ("' . implode('", "', $foreignKey->getColumns()) . '")';
+        $constraintName = $foreignKey->getConstraint() ?: $tableName . '_' . implode('_', $foreignKey->getColumns());
+        $def = ' CONSTRAINT "' . $constraintName . '" FOREIGN KEY ("' . implode('", "', $foreignKey->getColumns()) . '")';
         $def .= " REFERENCES {$foreignKey->getReferencedTable()->getName()} (\"" . implode('", "', $foreignKey->getReferencedColumns()) . '")';
         if ($foreignKey->getOnDelete()) {
             $def .= " ON DELETE {$foreignKey->getOnDelete()}";
@@ -1045,7 +1091,7 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
     /**
      * Checks to see if a schema exists.
      *
-     * @param string $schemaName  Schema Name
+     * @param string $schemaName Schema Name
      * @return boolean
      */
     public function hasSchema($schemaName)
@@ -1063,7 +1109,7 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
     /**
      * Drops the specified schema table.
      *
-     * @param string $tableName Table Name
+     * @param string $schemaName Schema name
      * @return void
      */
     public function dropSchema($schemaName)
@@ -1113,7 +1159,6 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
      */
     public function getColumnTypes()
     {
-        $types = parent::getColumnTypes();
         return array_merge(parent::getColumnTypes(), array(
             'json',
             'jsonb',
