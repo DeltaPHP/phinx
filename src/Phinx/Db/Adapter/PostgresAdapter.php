@@ -903,7 +903,9 @@ class PostgresAdapter extends PdoAdapter implements AdapterInterface
     protected function getDefaultValueDefinition($default)
     {
         if (is_string($default) && 'CURRENT_TIMESTAMP' !== $default) {
-            $default = $this->getConnection()->quote($default);
+            if (!$default instanceof Column\Param\FunctionParam) {
+                $default = $this->getConnection()->quote($default);
+            }
         } elseif (is_bool($default)) {
             $default = $default ? 'TRUE' : 'FALSE';
         }
